@@ -1,0 +1,401 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Tech Challenge #1 - 20190715
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'API Parameters'
+        Parameters:
+          - MyName   
+      - Label:
+          default: 'Alert Parameters'
+        Parameters:
+          - Email
+          - HttpEndpoint
+          - HttpsEndpoint
+      - Label:
+          default: 'Fallback Parameters'
+        Parameters:
+          - FallbackEmail
+
+Parameters:
+  MyName:
+    Type: String
+    Description: Name of the Candidate
+  Email:
+    Description: 'Optional email address that will receive alerts.'
+    Type: String
+    Default: ''
+  HttpEndpoint:
+    Description: 'Optional HTTP endpoint that will receive alerts via POST requests.'
+    Type: String
+    Default: ''
+  HttpsEndpoint:
+    Description: 'Optional HTTPS endpoint that will receive alerts via POST requests'
+    Type: String
+    Default: ''
+  FallbackEmail:
+    Description: 'Optional email address that will receive alerts if alerts can not be delivered.'
+    Type: String
+    Default: ''
+Conditions:
+  HasEmail: !Not [!Equals [!Ref Email, '']]
+  HasHttpEndpoint: !Not [!Equals [!Ref HttpEndpoint, '']]
+  HasHttpsEndpoint: !Not [!Equals [!Ref HttpsEndpoint, '']]
+  HasFallbackEmail: !Not [!Equals [!Ref FallbackEmail, '']]
+  
+Resources:
+  Topic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: 'Test SNS Topic'
+      TopicName: 'test-sns-topic'
+  TopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Id: Id1
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Sid1
+            Effect: Allow
+            Principal:
+              Service:
+                - 'dynamodb.amazonaws.com' # Allow DynamoDB Events
+            Action: 'sns:Publish'
+            Resource: !Ref Topic
+      Topics:
+        - !Ref Topic
+  FallbackTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: 'Test Fallback SNS topic'
+      TopicName: 'test-fallback-sns-topic'
+  EmailSubscription:
+    Condition: HasEmail
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Endpoint: !Ref Email
+      Protocol: email
+      TopicArn: !Ref Topic
+  HttpEndpointSubscription:
+    Condition: HasHttpEndpoint
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      DeliveryPolicy:
+        healthyRetryPolicy:
+          minDelayTarget: 1
+          maxDelayTarget: 60
+          numRetries: 100
+          numNoDelayRetries: 0
+          backoffFunction: exponential
+        throttlePolicy:
+          maxReceivesPerSecond: 1
+      Endpoint: !Ref HttpEndpoint
+      Protocol: http
+      TopicArn: !Ref Topic
+  HttpsEndpointSubscription:
+    Condition: HasHttpsEndpoint
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      DeliveryPolicy:
+        healthyRetryPolicy:
+          minDelayTarget: 1
+          maxDelayTarget: 60
+          numRetries: 100
+          numNoDelayRetries: 0
+          backoffFunction: exponential
+        throttlePolicy:
+          maxReceivesPerSecond: 1
+      Endpoint: !Ref HttpsEndpoint
+      Protocol: https
+      TopicArn: !Ref Topic
+  FallbackEmailSubscription:
+    Condition: HasFallbackEmail
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Endpoint: !Ref FallbackEmail
+      Protocol: email
+      TopicArn: !Ref FallbackTopic
+      
+  DynamoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub Challenge_${MyName}
+      AttributeDefinitions:
+        - AttributeName: team
+          AttributeType: S
+      KeySchema:
+        - AttributeName: team
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def dynamo_itemcreate(team_name, team_country, team_desc, team_rating):
+              dynamodb = boto3.client('dynamodb')
+              db_name = os.getenv('DB_NAME')
+              dynamodb.put_item(TableName=db_name, Item={'country':{'S':team_country}, 'team':{'S':team_name}, 'desc':{'S':team_desc}, 'rating':{'S':team_rating}})
+
+          def lambda_handler(event, context):
+              print('Team Country: %s' % event['team_country'])
+              print('Team Name: %s' % event['team_name'])
+              print('Team Description: %s' % event['team_desc'])
+              print('Team Rating: %s' % event['team_rating'])
+              dynamo_itemcreate(event['team_name'], event['team_country'], event['team_desc'],event['team_rating'])
+      Description: API Gateway TechChallenge
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.7
+      Timeout: 5
+      Environment:
+        Variables:
+          DB_NAME: !Sub Challenge_${MyName}
+  SNSLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import boto3
+          import os
+          
+          # Create an SNS client
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  for record in event['Records']:
+                      tableName=str(record['eventSourceARN'].split('/')[1])
+                      item=str(record['dynamodb']['NewImage'])
+                      if record['eventName'] == 'INSERT':
+                          # Publish DDB event to the specified SNS topic
+                          response = sns.publish(
+                              TopicArn=os.getenv('TOPIC'),    
+                              Message='Content of the new item added: ' +item,
+                              Subject='A new item has been added to table ' +tableName
+                          )
+                  print('Successfully processed %s records.' % str(len(event['Records'])))
+              except Exception as e:
+                  print('SNS notification failed...%s' %str(e))
+        
+      Description: API Gateway Secondary Task
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.7
+      Timeout: 5
+      Environment:
+        Variables:
+          TOPIC: !Ref Topic
+  LambdaEventRule: 
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      EventSourceArn: #trigger event from the ddb table
+        'Fn::GetAtt':
+          - DynamoTable
+          - StreamArn
+      FunctionName: #trigger the echo function previously defined
+        'Fn::GetAtt':
+          - SNSLambdaFunction
+          - Arn
+      StartingPosition: LATEST #always start at the tail of the stream
+            
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:*
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - dynamodb:PutItem
+            Resource: !Join
+               - ''
+               - - 'arn:aws:dynamodb:'
+                 - !Ref 'AWS::Region'
+                 - ':'
+                 - !Ref 'AWS::AccountId'
+                 - ':table/'
+                 - !Ref DynamoTable
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            Resource:
+            - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*:*'
+          - Action: 
+            - sns:Publish
+            Resource:
+              - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*'
+            Effect: Allow
+          - Action:
+            - dynamodb:DescribeStream
+            - dynamodb:GetRecords
+            - dynamodb:GetShardIterator
+            - dynamodb:ListStreams
+            Resource: !Join
+               - ''
+               - - 'arn:aws:dynamodb:'
+                 - !Ref 'AWS::Region'
+                 - ':'
+                 - !Ref 'AWS::AccountId'
+                 - ':table/'
+                 - !Ref DynamoTable
+                 - '/stream/*'
+            Effect: Allow           
+  APIPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:invokeFunction'
+      FunctionName:
+        'Fn::GetAtt':
+          - LambdaFunction
+          - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        'Fn::Join':
+          - ''
+          - - 'arn:aws:execute-api:'
+            - Ref: 'AWS::Region'
+            - ':'
+            - Ref: 'AWS::AccountId'
+            - ':'
+            - Ref: ApiRestApi
+            - /*
+
+  ApiRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Sub RestTechChallenge1_${MyName}
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt
+        - ApiRestApi
+        - RootResourceId
+      RestApiId: !Ref ApiRestApi
+      PathPart: 'add_new'
+
+  ApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiRestApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Join
+          - ''
+          - - 'arn:aws:apigateway:'
+            - !Ref 'AWS::Region'
+            - ':lambda:path/2015-03-31/functions/'
+            - !GetAtt
+              - LambdaFunction
+              - Arn
+            - /invocations
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: '{}'
+            ResponseParameters:
+              method.response.header.Location: integration.response.body.headers.uid
+            StatusCode: 201
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: '{ "team_name": $input.json(''team_name''), "team_country": $input.json(''team_country''), "team_desc": $input.json(''team_desc''), "team_rating": $input.json(''team_rating'')}'
+      RequestModels:
+        application/json: !Ref ApiModel
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Location: true
+          StatusCode: 201
+
+  ApiModel:
+    Type: 'AWS::ApiGateway::Model'
+    Properties:
+      ContentType: application/json
+      Name: Team
+      RestApiId: !Ref ApiRestApi
+      Schema:
+        title: Team
+        type: object
+        properties:
+          team_country:
+            type: string
+          team_name:
+            type: string
+          team_desc:
+            type: string
+          team_rating:
+            type: string
+
+  ApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref ApiRestApi
+      StageName: v1
+    DependsOn:
+      - ApiMethod
+      - ApiModel
+      - ApiRestApi
+      - APIPermission
+
+Outputs:
+  RootUrl:
+    Description: Root URL of the API gateway
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !Ref ApiRestApi
+        - .execute-api.
+        - !Ref 'AWS::Region'
+        - .amazonaws.com/v1/add_new
+  StreamArn:
+    Value: !GetAtt 'DynamoTable.StreamArn'
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamArn'
+  TopicARN:
+    Description: 'The ARN of the alert topic.'
+    Value: !Ref Topic
+    Export:
+      Name: !Sub '${AWS::StackName}-TopicARN'
